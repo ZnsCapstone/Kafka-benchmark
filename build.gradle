@@ -1,0 +1,41 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+group = 'com.hanyang.cs'
+version = '1.0'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.apache.kafka:kafka-clients:4.2.0'
+    implementation 'org.slf4j:slf4j-simple:2.0.7'
+}
+
+application {
+    mainClass = 'com.hanyang.cs.KafkaBenchmark'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+jar {
+    // 1. 중복 파일 처리 전략
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
+    // 2. 메인 클래스 지정
+    manifest {
+        attributes 'Main-Class': 'com.hanyang.cs.KafkaBenchmark'
+    }
+
+    // 3. 모든 의존성 라이브러리의 클래스 파일을 이 JAR 안에 포함시킴
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+}
