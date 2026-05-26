@@ -58,7 +58,7 @@ import org.apache.kafka.clients.producer.ProducerRecord;
  *   3) 종료 시 running=false → producer 스레드는 send 멈춤 → producer.flush() 로 in-flight
  *      콜백을 모두 처리한 후 통계 집계. 통계에는 ACK 받은 record 만 들어감.
  *
- *  메모리 안전성 (5.8GB RAM 환경 가정)
+ *  메모리 안전성
  *   - BUFFER_MEMORY 를 record size 에 따라 동적으로 조정 → OOM 방지.
  *   - 1KB/10KB → 16MB, 100KB → 32MB, 1MB → 64MB.
  *   - producer 수는 Python 자동화 스크립트에서 record size 별로 다르게 부여.
@@ -377,13 +377,14 @@ public class KafkaBenchmark {
             // -----------------------------------------------------------
             props.put(ProducerConfig.ACKS_CONFIG, "1");
 
+            int batchSize = recordSize + 512;
+
             // -----------------------------------------------------------
-            // BATCHING: application-level batching 최소화
-            //   LINGER_MS=5 + BATCH_SIZE=16KB → 적당한 batching 으로 throughput 확보,
-            //   동시에 broker 입장에서 자잘한 write 가 충분히 들어와 fs write pattern 차이 부각.
+            // BATCHING 제어 (조교 피드백 반영):
+            //   LINGER_MS=0, BATCH_SIZE=1 으로 batching 효과를 사실상 비활성화.
             // -----------------------------------------------------------
-            props.put(ProducerConfig.LINGER_MS_CONFIG, "5");
-            props.put(ProducerConfig.BATCH_SIZE_CONFIG, "16384");
+            props.put(ProducerConfig.LINGER_MS_CONFIG, "0");
+            props.put(ProducerConfig.BATCH_SIZE_CONFIG, String.valueOf(batchSize));
             props.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "none");
 
             // -----------------------------------------------------------
@@ -408,7 +409,7 @@ public class KafkaBenchmark {
             props.put(ProducerConfig.MAX_REQUEST_SIZE_CONFIG, "10485760");
 
             // -----------------------------------------------------------
-            // BUFFER_MEMORY 동적 조정 (OOM 방지 — 5.8GB RAM 환경)
+            // BUFFER_MEMORY 동적 조정 (OOM 방지)
             //   record size 별로 다르게 잡아서 producer × buffer 총량을 안전 범위로 유지.
             //   1KB,10KB → 16MB,  100KB → 32MB,  1MB → 64MB.
             //   비동기 send 라 buffer 가 빠르게 차오를 수 있어 record 크기에 비례하는 게 맞음.
@@ -425,6 +426,7 @@ public class KafkaBenchmark {
             if (id == 0) {
                 System.out.printf("[Config] BUFFER_MEMORY per producer = %d MB%n",
                         bufferPerProducer / (1024 * 1024));
+                System.out.printf("[Config] linger.ms=0, batch.size=%d%n", batchSize);
             }
 
             // Throttle 간격
