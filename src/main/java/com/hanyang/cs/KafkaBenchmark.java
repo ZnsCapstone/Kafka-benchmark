@@ -13,6 +13,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.LockSupport;
 
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.AdminClientConfig;
@@ -429,8 +430,9 @@ public class KafkaBenchmark {
                 System.out.printf("[Config] linger.ms=0, batch.size=%d%n", batchSize);
             }
 
-            // Throttle 간격
-            long intervalNs = 1_000_000_000L / opsPerSec;
+            // 목표 전송 간격. 1KB/100K OP/s 조건에서는 producer당 약 80us라
+            // Thread.sleep()의 ms 단위 스케줄링 오차를 그대로 받으면 안 된다.
+            long intervalNs = Math.max(1L, 1_000_000_000L / opsPerSec);
 
             KafkaProducer<String, byte[]> producer = null;
             try {
@@ -438,11 +440,32 @@ public class KafkaBenchmark {
                 readyLatch.countDown();
                 startLatch.await();
 
+                // 매 요청의 "다음 목표 시각"을 누적한다. 이전 요청 처리 시간이
+                // 짧거나 길어도 평균 전송률이 opsPerSec에 맞게 유지된다.
+                long nextSendNs = System.nanoTime();
+
                 // -------------------------------------------------------
                 // 메인 send 루프 (비동기)
                 // -------------------------------------------------------
                 while (running.get()) {
-                    long loopStart = System.nanoTime();
+                    // 1ms 이상의 Thread.sleep() 대신 hybrid pacing을 사용한다.
+                    // 긴 대기는 parkNanos로 CPU를 양보하고, 200us 이하의 짧은
+                    // 대기는 spin하여 OS scheduler의 밀리초급 wake-up 오차를 피한다.
+                    while (running.get()) {
+                        long remainingNs = nextSendNs - System.nanoTime();
+                        if (remainingNs <= 0) {
+                            break;
+                        }
+                        if (remainingNs > 200_000L) {
+                            // 마지막 100us는 spin 구간으로 남겨 정확도를 높인다.
+                            LockSupport.parkNanos(remainingNs - 100_000L);
+                        } else {
+                            Thread.onSpinWait();
+                        }
+                    }
+                    if (!running.get()) {
+                        break;
+                    }
 
                     ProducerRecord<String, byte[]> record =
                             new ProducerRecord<>(TOPIC_NAME, payload);
@@ -512,19 +535,10 @@ public class KafkaBenchmark {
                         sendErrors.incrementAndGet();
                     }
 
-                    // OP/s throttle
-                    long elapsed = System.nanoTime() - loopStart;
-                    if (elapsed < intervalNs) {
-                        long sleepNs = intervalNs - elapsed;
-                        long ms = sleepNs / 1_000_000L;
-                        int  ns = (int) (sleepNs % 1_000_000L);
-                        try {
-                            if (ms > 0 || ns > 0) Thread.sleep(ms, ns);
-                        } catch (InterruptedException ie) {
-                            Thread.currentThread().interrupt();
-                            break;
-                        }
-                    }
+                    // 이전 전송의 실제 완료 시각이 아니라 예정 시각을 기준으로
+                    // 다음 deadline을 잡는다. 따라서 짧은 sleep 오차가 요청마다
+                    // 누적되어 target OP/s가 낮아지는 문제를 막는다.
+                    nextSendNs += intervalNs;
                 }
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
