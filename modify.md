@@ -161,3 +161,106 @@ ACK된 요청 수를 고정된 `measureSec`로 나눈 값이다. `Drain Time`이
 시점에 backlog가 많이 남아 있었다는 의미이므로, 처리량과 함께 확인해야 한다.
 `Drain Completed=false`인 run은 callback과 latency 표본이 완전하지 않을 수 있어
 정상 비교 결과에서 제외해야 한다.
+
+## 2026-08-29 — 현재 해결해야 할 문제
+
+최근 결과에서는 pacing과 measurement 구간 분리 수정이 정상적으로 적용됐다.
+유효한 run에서 `total_requests / 60초`와 `Achieved OP/s`가 일치하므로 기존의
+drain 시간 포함 문제는 해결됐다. 다만 아래 문제들이 남아 있어, 현재 결과만으로
+filesystem의 정상 부하 latency나 안정적인 우열을 결론 내리기는 어렵다.
+
+### 1순위: 포화 실험과 latency 실험 분리
+
+현재 record size별 target은 모두 약 100MB/s의 offered load를 만든다.
+
+```text
+1KB    × 100,000 OP/s ≈ 100MB/s
+10KB   ×  10,000 OP/s ≈ 100MB/s
+100KB  ×   1,000 OP/s ≈ 100MB/s
+1MB    ×     100 OP/s ≈ 100MB/s
+```
+
+반면 실제 Kafka·DM·ZNS 경로의 처리량은 대체로 약 30~60MB/s 범위이므로 요청이
+처리 속도보다 빠르게 쌓인다. 그 결과 app p99가 수십 초까지 증가하고 drain도
+길어진다. 이는 측정기 오류라기보다 지속적인 overload와 queueing을 관찰한 값이다.
+
+따라서 실험을 두 종류로 분리해야 한다.
+
+- Saturation profile: 현재처럼 높은 target으로 최대 처리량과 포화 특성을 측정한다.
+- Latency profile: 최대 처리량보다 충분히 낮은 target에서 filesystem latency를
+  비교한다. 초기 후보는 약 20MB/s인 `{1KB: 20000, 10KB: 2000,
+  100KB: 200, 1MB: 20}`이다.
+- Latency profile에서는 drain이 짧고 queue가 지속적으로 증가하지 않는지 확인한
+  뒤 latency를 비교해야 한다.
+
+### 2순위: 처리량 지표의 의미 분리
+
+현재 `Achieved OP/s`는 measurement 구간에 send된 요청 중 drain 종료 전까지
+ACK된 성공 요청 수를 `measureSec`로 나눈 값이다. 따라서 measurement 종료 시점에
+처리되지 않았던 요청도 drain 중 ACK되면 achieved 수에 들어간다. 분모는 정확해졌지만
+이 값만으로 measurement 60초 동안 broker가 실제 완료한 지속 가능 처리량을 알 수는
+없다.
+
+다음 지표를 별도로 출력해야 한다.
+
+- `Sent OP/s`: measurement 구간에 생성한 요청 수 / measurement 시간
+- `ACK Window OP/s`: measurement 구간 안에서 ACK까지 끝난 요청 수 / measurement 시간
+- `Eventual ACK OP/s`: measurement 중 send되고 drain까지 ACK된 요청 수 / measurement 시간
+- `Outstanding at End`: measurement 종료 시점의 미완료 요청 수
+- `Failed/Timed-out Requests`: 실패 및 drain timeout으로 미완료된 요청 수
+
+이렇게 분리해야 offered load, 실제 측정 구간 완료량, drain으로 넘어간 backlog를
+혼동하지 않는다.
+
+### 3순위: 무제한 outstanding 요청과 latency 폭증 방지
+
+비동기 producer가 backend 처리 속도보다 빠르게 요청을 계속 생성하면 Kafka producer
+buffer와 내부 queue에 매우 많은 요청이 쌓인다. 이때 app latency는 filesystem 처리
+시간뿐 아니라 producer buffer 대기, Kafka queueing, broker 처리 및 ACK 대기를 모두
+포함하므로 수 초에서 수십 초까지 증가할 수 있다.
+
+정상 부하 latency 실험에는 semaphore 등으로 최대 in-flight 요청 수를 제한하는
+옵션이 필요하다. 제한에 걸린 시간 또는 횟수도 backpressure 지표로 기록해야 한다.
+다만 saturation 실험에서는 이 제한이 offered load를 바꾸므로 on/off 가능한 옵션으로
+두고, 설정값을 보고서에 반드시 남겨야 한다.
+
+### 4순위: pacing의 catch-up burst 제한
+
+현재 absolute-time pacing은 누적 wake-up 오차를 막는 데 유효하지만, producer가
+예정 시각보다 크게 늦어진 경우 밀린 schedule을 따라잡으려고 요청을 연속 전송할 수
+있다. 이 catch-up burst가 순간적인 queue 증가와 tail latency를 악화시킬 수 있다.
+
+최대 catch-up 요청 수 또는 최대 허용 지연을 정하고, 임계값을 넘으면 `nextSendNs`를
+현재 시각 기준으로 재설정하는 옵션을 추가해야 한다. 발생 횟수도 결과에 기록하여
+목표 rate 유지와 burst 억제의 trade-off를 확인해야 한다.
+
+### 5순위: Dynamic topic 오류 원인 분리 및 무효 처리
+
+최근 Dynamic 결과에는 `send_errors > 0`, `total_requests == 0`, 80~100초 이상의
+긴 drain이 반복된다. 특히 실행 시간이 기존 60초에서 warmup 20초 + measurement
+60초로 늘면서 topic 생성기도 더 오래 동작하여, 5 topics/s 기준 최대 약 400개의
+topic이 만들어질 수 있다. topic 생성과 metadata 갱신 부하가 filesystem 비교를
+압도할 가능성이 있다.
+
+- `send_errors > 0`, `total_requests == 0`, `Drain Completed=false`인 run은 자동으로
+  `INVALID` 처리한다.
+- 최초 오류 유형, 예외 메시지, 오류가 시작된 시각 및 topic 수를 결과에 저장한다.
+- topic 생성 성공/실패 수와 최종 topic 수를 별도 지표로 출력한다.
+- filesystem baseline과 Dynamic topic 실험을 별도 실행 모드로 분리한다.
+- Dynamic rate 5/s가 목적에 맞는지 검토하고 낮은 rate부터 단계적으로 올린다.
+
+### 6순위: 모니터링 대상과 bottleneck 판정 개선
+
+현재 `iostat await` 하나만으로는 `/dev/mapper/kafka-zns`, raw ZNS 장치, DM 내부에서
+어디에 지연이 생겼는지 구분하기 어렵다. mapper와 raw device를 동시에 기록하고,
+가능하면 DM 통계와 Kafka producer/broker 지표도 함께 수집해야 한다.
+
+또한 현재 bottleneck 판정은 높은 await나 iowait가 있어도 util 조건을 동시에
+만족하지 않으면 `false`가 될 수 있다. Dynamic 오류로 부하가 중간에 끊긴 run도
+낮은 평균 util 때문에 정상처럼 보일 수 있으므로, 단일 boolean 대신 다음 상태를
+구분하는 편이 안전하다.
+
+- `SATURATED`: 높은 utilization과 지속적인 backlog가 확인됨
+- `BACKPRESSURED`: 긴 drain 또는 outstanding 증가가 확인됨
+- `FAILED`: send error, zero success 또는 drain timeout 발생
+- `NOT_SATURATED`: 낮은 부하에서 오류와 backlog가 없음
