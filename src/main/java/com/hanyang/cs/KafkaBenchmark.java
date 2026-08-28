@@ -102,12 +102,17 @@ public class KafkaBenchmark {
     private static int numProducers = 16;
     private static boolean useConsumer = false;
     private static boolean dynamicTopicCreation = false;
-    private static int durationSec = 60;
     private static int warmupSec = 0;
+    private static int measureSec = 60;
+    private static int drainTimeoutSec = 180;
     private static int dynamicTopicRate = 1;
 
     public static void main(String[] args) throws Exception {
         parseArgs(args);
+        if (warmupSec < 0 || measureSec <= 0 || drainTimeoutSec <= 0) {
+            throw new IllegalArgumentException(
+                    "warmup-sec must be >= 0; measure-sec and drain-timeout-sec must be > 0");
+        }
 
         System.out.println("=====================================");
         System.out.println(" Kafka Filesystem Benchmark (Java API) ");
@@ -118,8 +123,8 @@ public class KafkaBenchmark {
         System.out.printf(" - Consumer Active: %b%n", useConsumer);
         System.out.printf(" - Dynamic Topic Creation: %b (rate=%d/sec)%n",
                 dynamicTopicCreation, dynamicTopicRate);
-        System.out.printf(" - Warmup: %d sec / Total Duration: %d sec%n",
-                warmupSec, durationSec);
+        System.out.printf(" - Warmup: %d sec / Measurement: %d sec / Drain timeout: %d sec%n",
+                warmupSec, measureSec, drainTimeoutSec);
         System.out.println(" - Send mode: ASYNC (callback-based latency measurement)");
 
         AtomicBoolean running = new AtomicBoolean(true);
@@ -134,7 +139,7 @@ public class KafkaBenchmark {
 
         // 비동기 send 라 producer 한 개가 큐에 많이 쌓을 수 있음.
         // 2.0x 여유로 latency 배열 크기 결정 (capacity 초과는 silently drop).
-        int perProducerCapacity = Math.max(2048, (int) (opsPerProducer * durationSec * 2.0));
+        int perProducerCapacity = Math.max(2048, (int) (opsPerProducer * measureSec * 2.0));
 
         ProducerTask[] tasks = new ProducerTask[numProducers];
         ExecutorService executor = Executors.newFixedThreadPool(
@@ -164,29 +169,37 @@ public class KafkaBenchmark {
         }
 
         readyLatch.await();
-        long startTime = System.currentTimeMillis();
-        ProducerTask.globalStartTime = startTime;
+        long startTimeMs = System.currentTimeMillis();
+        long startTimeNs = System.nanoTime();
+        ProducerTask.globalStartTime = startTimeMs;
+        ProducerTask.measureStartNs = startTimeNs + TimeUnit.SECONDS.toNanos(warmupSec);
+        ProducerTask.measureEndNs = ProducerTask.measureStartNs
+                + TimeUnit.SECONDS.toNanos(measureSec);
         startLatch.countDown();
 
-        System.out.printf("[Run] Producers started. warmup=%ds, total=%ds%n",
-                warmupSec, durationSec);
+        System.out.printf("[Run] Producers started. warmup=%ds, measure=%ds, total=%ds%n",
+                warmupSec, measureSec, warmupSec + measureSec);
 
-        Thread.sleep(durationSec * 1000L);
+        Thread.sleep(((long) warmupSec + measureSec) * 1000L);
         running.set(false);
+
+        long drainStartNs = System.nanoTime();
 
         // 비동기라 producer 의 send loop 가 멈춰도 in-flight 콜백이 남아 있음.
         // doneLatch 는 ProducerTask 가 producer.close() 를 마친 후에 countDown 함.
         // close() 내부에서 flush() 가 호출되므로 모든 in-flight callback 이 실행된 후 doneLatch 깨어남.
-        // 180초 cap: broker 응답이 늦어지는 극단 케이스 안전망.
-        boolean cleanFinish = doneLatch.await(180, TimeUnit.SECONDS);
+        // drain timeout: broker 응답이 늦어지는 극단 케이스 안전망.
+        boolean cleanFinish = doneLatch.await(drainTimeoutSec, TimeUnit.SECONDS);
         if (!cleanFinish) {
-            System.err.println("[Warn] Some producers did not finish in 180s. Forcing shutdown.");
+            System.err.printf("[Warn] Some producers did not finish in %ds. Forcing shutdown.%n",
+                    drainTimeoutSec);
         }
+        long drainElapsedNs = System.nanoTime() - drainStartNs;
 
         executor.shutdownNow();
         executor.awaitTermination(10, TimeUnit.SECONDS);
 
-        printMetrics(tasks, startTime);
+        printMetrics(tasks, drainElapsedNs, cleanFinish);
     }
 
     /**
@@ -198,7 +211,9 @@ public class KafkaBenchmark {
      *   "Total Sent (incl. warmup) : %d" / "Send Errors : %d"
      * 출력 포맷을 바꾸면 Python 파서도 함께 수정 필요.
      */
-    private static void printMetrics(ProducerTask[] tasks, long globalStartMs) {
+    private static void printMetrics(ProducerTask[] tasks,
+                                     long drainElapsedNs,
+                                     boolean cleanFinish) {
         long totalSamples = 0;
         long totalSentIncludingWarmup = 0;
         long totalSendErrors = 0;
@@ -213,8 +228,23 @@ public class KafkaBenchmark {
         if (totalSamples == 0) {
             System.out.println("\n--- [ Latency Results (ms) ] ---");
             System.out.println(" No samples recorded after warmup.");
+            System.out.println(" Total Requests : 0");
+            System.out.println(" Average        : 0.00 ms");
+            System.out.println(" p50 (Median)   : 0.00 ms");
+            System.out.println(" p90            : 0.00 ms");
+            System.out.println(" p99            : 0.00 ms");
+            System.out.println(" p999           : 0.00 ms");
+            System.out.println(" Max            : 0.00 ms");
+            System.out.println("--------------------------------");
+            System.out.println("--- [ Throughput / Errors ] ---");
+            System.out.printf(" Target OP/s         : %d%n", targetOps);
+            System.out.println(" Achieved OP/s       : 0.00");
+            System.out.println(" Achieved/Target (%) : 0.0");
             System.out.printf(" Total Sent (incl. warmup) : %d%n", totalSentIncludingWarmup);
             System.out.printf(" Send Errors               : %d%n", totalSendErrors);
+            System.out.printf(" Drain Time                : %.2f sec%n",
+                    drainElapsedNs / 1_000_000_000.0);
+            System.out.printf(" Drain Completed           : %b%n", cleanFinish);
             System.out.println("--------------------------------");
             return;
         }
@@ -243,9 +273,9 @@ public class KafkaBenchmark {
         double p999 = percentile(all, 0.999) / 1_000_000.0;
         double max  = all[all.length - 1] / 1_000_000.0;
 
-        long elapsedMs = System.currentTimeMillis() - globalStartMs;
-        long measureWindowMs = Math.max(1L, elapsedMs - warmupSec * 1000L);
-        double achievedOpsPerSec = (totalSamples * 1000.0) / measureWindowMs;
+        // Measurement 구간에 send 된 요청만 모았으므로 throughput 분모는 항상
+        // 고정된 measurement 시간이다. flush/drain 시간은 절대 포함하지 않는다.
+        double achievedOpsPerSec = totalSamples / (double) Math.max(1, measureSec);
 
         System.out.println("\n--- [ Latency Results (ms) ] ---");
         System.out.println(" (App-level: send() call -> broker ACK; reaches OS page cache)");
@@ -264,10 +294,13 @@ public class KafkaBenchmark {
                 (achievedOpsPerSec / Math.max(1, targetOps)) * 100.0);
         System.out.printf(" Total Sent (incl. warmup) : %d%n", totalSentIncludingWarmup);
         System.out.printf(" Send Errors               : %d%n", totalSendErrors);
+        System.out.printf(" Drain Time                : %.2f sec%n",
+                drainElapsedNs / 1_000_000_000.0);
+        System.out.printf(" Drain Completed           : %b%n", cleanFinish);
         System.out.println("--------------------------------");
         System.out.println("\n--- [ Per-second Throughput & Latency ] ---");
 
-        for (int sec = 0; sec < durationSec; sec++) {
+        for (int sec = 0; sec < warmupSec + measureSec; sec++) {
             long send = sendBuckets[sec].get();
             long ack  = ackBuckets[sec].get();
 
@@ -320,6 +353,9 @@ public class KafkaBenchmark {
     static class ProducerTask implements Runnable {
         // 모든 producer 가 공유하는 글로벌 시작 시각 (warmup 컷오프 판정용).
         static volatile long globalStartTime = 0L;
+        // monotonic clock 기준 measurement 경계. main thread가 startLatch를 열기 전에 설정한다.
+        static volatile long measureStartNs = 0L;
+        static volatile long measureEndNs = 0L;
 
         private final int id;
         private final int opsPerSec;
@@ -447,7 +483,7 @@ public class KafkaBenchmark {
                 // -------------------------------------------------------
                 // 메인 send 루프 (비동기)
                 // -------------------------------------------------------
-                while (running.get()) {
+                while (running.get() && System.nanoTime() < measureEndNs) {
                     // 1ms 이상의 Thread.sleep() 대신 hybrid pacing을 사용한다.
                     // 긴 대기는 parkNanos로 CPU를 양보하고, 200us 이하의 짧은
                     // 대기는 spin하여 OS scheduler의 밀리초급 wake-up 오차를 피한다.
@@ -483,6 +519,11 @@ public class KafkaBenchmark {
                     // 람다에서 캡쳐하기 위해 final 지역 변수.
                     // 매 send 마다 새 sendStart 가 캡쳐되어야 하므로 람다 안에서 측정 시점 기록.
                     final long sendStart = System.nanoTime();
+                    // 요청이 어느 구간에 속하는지는 ACK 시각이 아니라 send 시각으로
+                    // 고정한다. warmup 요청의 늦은 ACK가 measurement에 섞이지 않고,
+                    // measurement 요청의 ACK가 drain 중 도착해도 latency에 포함된다.
+                    final boolean measured = sendStart >= measureStartNs
+                            && sendStart < measureEndNs;
                     try {
                         // ★ 비동기 send + 콜백
                         //
@@ -521,8 +562,7 @@ public class KafkaBenchmark {
                             }
                             // =================================================
 
-                            // 기존 warmup 필터 (그대로 유지)
-                            if (now - globalStartTime > warmupSec * 1000L) {
+                            if (measured) {
                                 int idx = recordedCount.getAndIncrement();
                                 if (idx < latenciesNs.length) {
                                     latenciesNs[idx] = latency;
@@ -664,8 +704,11 @@ public class KafkaBenchmark {
                 case "--producers":          numProducers = Integer.parseInt(args[++i]); break;
                 case "--use-consumer":       useConsumer = Boolean.parseBoolean(args[++i]); break;
                 case "--dynamic-topics":     dynamicTopicCreation = Boolean.parseBoolean(args[++i]); break;
-                case "--duration":           durationSec = Integer.parseInt(args[++i]); break;
                 case "--warmup-sec":         warmupSec = Integer.parseInt(args[++i]); break;
+                case "--measure-sec":        measureSec = Integer.parseInt(args[++i]); break;
+                case "--drain-timeout-sec":  drainTimeoutSec = Integer.parseInt(args[++i]); break;
+                // 이전 자동화 스크립트와의 호환성을 위한 alias. 새 코드는 --measure-sec 사용.
+                case "--duration":           measureSec = Integer.parseInt(args[++i]); break;
                 case "--dynamic-topic-rate": dynamicTopicRate = Integer.parseInt(args[++i]); break;
                 default:
                     System.err.println("[Warn] Unknown arg: " + args[i]);
