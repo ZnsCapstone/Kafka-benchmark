@@ -1,0 +1,36 @@
+package com.hanyang.cs;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
+import org.junit.jupiter.api.Test;
+
+class KafkaBenchmarkTest {
+    @Test
+    void distributesTargetRateWithoutLosingRemainder() {
+        assertArrayEquals(
+                new int[] {2, 2, 2, 1, 1},
+                KafkaBenchmark.distributeRate(8, 5));
+    }
+
+    @Test
+    void supportsMoreProducersThanTargetOperations() {
+        assertArrayEquals(
+                new int[] {1, 1, 1, 0, 0},
+                KafkaBenchmark.distributeRate(3, 5));
+    }
+
+    @Test
+    void latencyCapacityIncludesOneSecondOfHeadroom() {
+        assertEquals(61_024, KafkaBenchmark.latencyCapacity(1_000, 60));
+        assertEquals(1_024, KafkaBenchmark.latencyCapacity(0, 60));
+    }
+
+    @Test
+    void rejectsLatencyArraysLargerThanJvmLimit() {
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> KafkaBenchmark.latencyCapacity(Integer.MAX_VALUE, 2));
+    }
+}
