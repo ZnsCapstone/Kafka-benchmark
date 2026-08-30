@@ -143,6 +143,19 @@ latency profile을 분리하고 mapper 및 raw ZNS 장치를 동시에 모니터
   만들기 위한 의도된 trade-off이므로, 결과 분석 시 CPU 사용률도 함께 기록한다.
 - 수정 후에는 `./gradlew clean jar`로 JAR를 다시 빌드해야 한다.
 
+## 2026-08-30 — Consumer 정합성 및 ACK stall 측정
+
+- 모든 producer record에 고정 producer key와 producer ID/sequence header를 넣는다.
+  같은 producer의 레코드는 같은 partition으로 전송되므로 consumer가 producer별
+  순서, gap, duplicate를 검사할 수 있다.
+- payload는 기존과 동일한 고정 크기를 유지하고 consumer가 길이와 CRC32를 확인한다.
+- producer flush가 끝난 뒤 consumer가 연속 10초 동안 새 레코드가 없을 때까지
+  drain한다. producer 성공 ACK 수와 최종 consume 수가 다르면 정합성 실패다.
+- malformed header, payload CRC 오류, sequence gap, duplicate, out-of-order를 각각
+  출력한다. 이 지표는 성능 latency와 별개이며 하나라도 발생하면 run을 무효화한다.
+- measurement 구간에서 ACK가 0인 연속 초를 stall count/total/max로 출력한다.
+  평균 disk util이 낮아도 긴 zero-ACK 정지를 별도로 식별할 수 있다.
+
 ### Pacing 수정 전·후 결과 해석
 
 동일한 target OP/s 설정으로 pacing 수정 전과 수정 후의 벤치마크 결과를

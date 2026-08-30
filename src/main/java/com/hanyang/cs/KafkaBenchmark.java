@@ -1,6 +1,9 @@
 package com.hanyang.cs;
 
 import java.time.Duration;
+import java.nio.ByteBuffer;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Properties;
@@ -15,16 +18,20 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
+import java.util.zip.CRC32;
 
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.header.internals.RecordHeader;
 
 /**
  * =============================================================================
@@ -71,6 +78,9 @@ import org.apache.kafka.clients.producer.ProducerRecord;
  */
 public class KafkaBenchmark {
 
+    private static final String SEQUENCE_HEADER = "benchmark-sequence";
+    private static final int SEQUENCE_HEADER_BYTES = Integer.BYTES + Long.BYTES;
+
     // CLI로 덮어쓸 수 있는 접속 및 실행 기본값.
     private static String bootstrapServers = "localhost:9092";
     private static String topicName = "bench-topic";
@@ -112,6 +122,7 @@ public class KafkaBenchmark {
         System.out.println(" - Send mode: ASYNC (callback-based latency measurement)");
 
         AtomicBoolean running = new AtomicBoolean(true);
+        AtomicBoolean producersFinished = new AtomicBoolean(false);
         CountDownLatch readyLatch = new CountDownLatch(numProducers);
         CountDownLatch startLatch = new CountDownLatch(1);
         CountDownLatch doneLatch = new CountDownLatch(numProducers);
@@ -135,8 +146,10 @@ public class KafkaBenchmark {
             executor.submit(tasks[i]);
         }
 
+        ConsumerTask consumerTask = null;
         if (useConsumer) {
-            executor.submit(new ConsumerTask(running));
+            consumerTask = new ConsumerTask(running, producersFinished, payload);
+            executor.submit(consumerTask);
         }
 
         if (dynamicTopicCreation) {
@@ -185,10 +198,20 @@ public class KafkaBenchmark {
         }
         long drainElapsedNs = System.nanoTime() - drainStartNs;
 
+        producersFinished.set(true);
+        boolean consumerDrainCompleted = true;
+        if (consumerTask != null) {
+            consumerDrainCompleted = consumerTask.doneLatch.await(30, TimeUnit.SECONDS);
+            if (!consumerDrainCompleted) {
+                System.err.println("[Warn] Consumer did not finish its post-producer drain in 30s.");
+            }
+        }
+
         executor.shutdownNow();
         executor.awaitTermination(10, TimeUnit.SECONDS);
 
-        printMetrics(tasks, drainElapsedNs, cleanFinish, outstandingAtEnd);
+        printMetrics(tasks, consumerTask, drainElapsedNs, cleanFinish,
+                consumerDrainCompleted, outstandingAtEnd);
     }
 
     /**
@@ -199,8 +222,10 @@ public class KafkaBenchmark {
      * 때 Python 정규식과 CSV schema도 함께 수정해야 한다.
      */
     private static void printMetrics(ProducerTask[] tasks,
+                                     ConsumerTask consumerTask,
                                      long drainElapsedNs,
                                      boolean cleanFinish,
+                                     boolean consumerDrainCompleted,
                                      long outstandingAtEnd) {
         long totalSamples = 0;
         long totalSentIncludingWarmup = 0;
@@ -316,6 +341,10 @@ public class KafkaBenchmark {
                 outstandingAtEnd, failedRequests, unresolvedAfterDrain, droppedSamples,
                 limiterWaitCount, limiterWaitNs, maxObservedOutstanding,
                 catchUpResets, skippedCatchUp, maxScheduleLagNs);
+        printAckStallMetrics(tasks);
+        if (consumerTask != null) {
+            consumerTask.printMetrics(consumerDrainCompleted, totalSentIncludingWarmup);
+        }
         System.out.println("--------------------------------");
         System.out.println("\n--- [ Per-second Throughput & Latency ] ---");
 
@@ -360,6 +389,36 @@ public class KafkaBenchmark {
         }
 
         System.out.println("------------------------------------------");
+    }
+
+    /** Measurement 구간에서 ACK가 한 건도 없었던 연속 구간을 stall로 집계한다. */
+    private static void printAckStallMetrics(ProducerTask[] tasks) {
+        long[] ackBySecond = new long[measureSec];
+        for (int sec = warmupSec; sec < warmupSec + measureSec; sec++) {
+            for (ProducerTask task : tasks) {
+                ackBySecond[sec - warmupSec] += task.ackBuckets[sec].get();
+            }
+        }
+        int[] stalls = calculateAckStalls(ackBySecond);
+        System.out.printf(" ACK Stall Count          : %d%n", stalls[0]);
+        System.out.printf(" ACK Stall Total          : %d sec%n", stalls[1]);
+        System.out.printf(" ACK Stall Max            : %d sec%n", stalls[2]);
+    }
+
+    /** 반환 순서는 stall 구간 수, zero-ACK 총 초, 최장 연속 초다. */
+    static int[] calculateAckStalls(long[] ackBySecond) {
+        int stallCount = 0, stallTotalSec = 0, stallMaxSec = 0, currentSec = 0;
+        for (long ack : ackBySecond) {
+            if (ack == 0) {
+                if (currentSec == 0) stallCount++;
+                currentSec++;
+                stallTotalSec++;
+                stallMaxSec = Math.max(stallMaxSec, currentSec);
+            } else {
+                currentSec = 0;
+            }
+        }
+        return new int[] {stallCount, stallTotalSec, stallMaxSec};
     }
 
     /**
@@ -493,6 +552,7 @@ public class KafkaBenchmark {
         private final int id;
         private final int opsPerSec;
         private final byte[] payload;
+        private long nextSequence = 0;
         private final AtomicBoolean running;
         private final CountDownLatch readyLatch;
         private final CountDownLatch startLatch;
@@ -658,7 +718,12 @@ public class KafkaBenchmark {
                         break;
                     }
 
-                    ProducerRecord<String, byte[]> record = new ProducerRecord<>(topicName, payload);
+                    long sequence = nextSequence++;
+                    byte[] sequenceBytes = ByteBuffer.allocate(SEQUENCE_HEADER_BYTES)
+                            .putInt(id).putLong(sequence).array();
+                    ProducerRecord<String, byte[]> record = new ProducerRecord<>(
+                            topicName, Integer.toString(id), payload);
+                    record.headers().add(new RecordHeader(SEQUENCE_HEADER, sequenceBytes));
                     final long sendStart = System.nanoTime();
                     final int sendSecond = elapsedSecond(sendStart);
                     if (sendSecond >= 0 && sendSecond < sendBuckets.length) {
@@ -759,9 +824,23 @@ public class KafkaBenchmark {
      */
     static class ConsumerTask implements Runnable {
         private final AtomicBoolean running;
+        private final AtomicBoolean producersFinished;
+        private final byte[] expectedPayload;
+        private final long expectedPayloadCrc;
+        final CountDownLatch doneLatch = new CountDownLatch(1);
+        final AtomicLong consumed = new AtomicLong(0);
+        final AtomicLong malformedHeaders = new AtomicLong(0);
+        final AtomicLong payloadErrors = new AtomicLong(0);
+        final AtomicLong sequenceGaps = new AtomicLong(0);
+        final AtomicLong duplicates = new AtomicLong(0);
+        final AtomicLong outOfOrder = new AtomicLong(0);
 
-        public ConsumerTask(AtomicBoolean running) {
+        public ConsumerTask(AtomicBoolean running, AtomicBoolean producersFinished,
+                            byte[] expectedPayload) {
             this.running = running;
+            this.producersFinished = producersFinished;
+            this.expectedPayload = expectedPayload;
+            this.expectedPayloadCrc = crc32(expectedPayload);
         }
 
         @Override
@@ -792,20 +871,80 @@ public class KafkaBenchmark {
             try (KafkaConsumer<String, byte[]> consumer = new KafkaConsumer<>(props)) {
                 // subscribe 후 실제 partition assignment는 첫 poll에서 수행된다.
                 consumer.subscribe(Collections.singletonList(topicName));
-                long consumed = 0;
-                while (running.get()) {
+                Map<Integer, Long> lastSequence = new HashMap<>();
+                int idlePollsAfterProducers = 0;
+                while (running.get() || !producersFinished.get()
+                        || idlePollsAfterProducers < 100) {
                     // seek를 반복하지 않고 현재 position에서 순차 consume한다. 따라서
                     // 같은 record를 반복해서 읽는 인위적인 read amplification이 없다.
                     ConsumerRecords<String, byte[]> records =
                             consumer.poll(Duration.ofMillis(100));
-                    consumed += records.count();
+                    if (producersFinished.get() && records.isEmpty()) {
+                        idlePollsAfterProducers++;
+                    } else if (!records.isEmpty()) {
+                        idlePollsAfterProducers = 0;
+                    }
+                    for (ConsumerRecord<String, byte[]> record : records) {
+                        verifyRecord(record, lastSequence);
+                        consumed.incrementAndGet();
+                    }
                 }
                 // running=false 뒤 추가 poll은 하지 않는다. 출력값은 consumer가 실제로
                 // 반환받은 record 수이며 producer ACK 수와 반드시 같지는 않다.
-                System.out.printf("[Consumer] consumed %d records%n", consumed);
+                System.out.printf("[Consumer] consumed %d records%n", consumed.get());
             } catch (Exception e) {
                 System.err.println("[Consumer] error: " + e);
+            } finally {
+                doneLatch.countDown();
             }
+        }
+
+        private void verifyRecord(ConsumerRecord<String, byte[]> record,
+                                  Map<Integer, Long> lastSequence) {
+            Header header = record.headers().lastHeader(SEQUENCE_HEADER);
+            if (header == null || header.value() == null
+                    || header.value().length != SEQUENCE_HEADER_BYTES) {
+                malformedHeaders.incrementAndGet();
+                return;
+            }
+            ByteBuffer sequence = ByteBuffer.wrap(header.value());
+            int producerId = sequence.getInt();
+            long current = sequence.getLong();
+            Long previous = lastSequence.put(producerId, current);
+            if (previous != null) {
+                if (current == previous) duplicates.incrementAndGet();
+                else if (current < previous) outOfOrder.incrementAndGet();
+                else if (current > previous + 1) sequenceGaps.addAndGet(current - previous - 1);
+            } else if (current > 0) {
+                sequenceGaps.addAndGet(current);
+            }
+            byte[] value = record.value();
+            if (value == null || value.length != expectedPayload.length
+                    || crc32(value) != expectedPayloadCrc) {
+                payloadErrors.incrementAndGet();
+            }
+        }
+
+        void printMetrics(boolean drainCompleted, long producerAckedIncludingWarmup) {
+            long consumedCount = consumed.get();
+            System.out.println("--- [ Consumer Integrity ] ---");
+            System.out.printf(" Consumer Records         : %d%n", consumedCount);
+            System.out.printf(" Producer ACKed Records   : %d%n", producerAckedIncludingWarmup);
+            System.out.printf(" Consumer Record Delta    : %d%n",
+                    producerAckedIncludingWarmup - consumedCount);
+            System.out.printf(" Consumer Drain Completed : %b%n", drainCompleted);
+            System.out.printf(" Malformed Headers        : %d%n", malformedHeaders.get());
+            System.out.printf(" Payload CRC Errors       : %d%n", payloadErrors.get());
+            System.out.printf(" Sequence Gaps            : %d%n", sequenceGaps.get());
+            System.out.printf(" Duplicate Records        : %d%n", duplicates.get());
+            System.out.printf(" Out-of-order Records     : %d%n", outOfOrder.get());
+            System.out.println("--------------------------------");
+        }
+
+        private static long crc32(byte[] value) {
+            CRC32 crc = new CRC32();
+            crc.update(value);
+            return crc.getValue();
         }
     }
 

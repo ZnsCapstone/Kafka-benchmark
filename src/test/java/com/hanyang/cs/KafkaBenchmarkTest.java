@@ -33,4 +33,11 @@ class KafkaBenchmarkTest {
                 IllegalArgumentException.class,
                 () -> KafkaBenchmark.latencyCapacity(Integer.MAX_VALUE, 2));
     }
+
+    @Test
+    void countsSeparateAndConsecutiveAckStalls() {
+        assertArrayEquals(
+                new int[] {2, 5, 3},
+                KafkaBenchmark.calculateAckStalls(new long[] {10, 0, 0, 4, 0, 0, 0, 8}));
+    }
 }
