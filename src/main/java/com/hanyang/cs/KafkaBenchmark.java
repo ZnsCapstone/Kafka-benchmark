@@ -98,6 +98,7 @@ public class KafkaBenchmark {
     private static int maxCatchUpRecords = 0;
     private static long maxScheduleLagMs = 0;
     private static int producerStartTimeoutSec = 90;
+    private static int failFastStallSec = 60;
 
     public static void main(String[] args) throws Exception {
         parseArgs(args);
@@ -119,6 +120,8 @@ public class KafkaBenchmark {
         System.out.printf(" - Catch-up limit: records=%s, lag=%s%n",
                 maxCatchUpRecords == 0 ? "unlimited" : Integer.toString(maxCatchUpRecords),
                 maxScheduleLagMs == 0 ? "unlimited" : maxScheduleLagMs + "ms");
+        System.out.printf(" - Fail-fast ACK stall: %s%n",
+                failFastStallSec == 0 ? "disabled" : failFastStallSec + " sec");
         System.out.println(" - Send mode: ASYNC (callback-based latency measurement)");
 
         AtomicBoolean running = new AtomicBoolean(true);
@@ -172,6 +175,9 @@ public class KafkaBenchmark {
         ProducerTask.globalStartNs = startTimeNs;
         ProducerTask.globalOutstanding.set(0);
         ProducerTask.globalMaxOutstanding.set(0);
+        ProducerTask.globalFailures.set(0);
+        ProducerTask.globalLastSuccessfulAckNs.set(startTimeNs);
+        ProducerTask.globalFailFastAbort.set(false);
         ProducerTask.measureStartNs = startTimeNs + TimeUnit.SECONDS.toNanos(warmupSec);
         ProducerTask.measureEndNs = ProducerTask.measureStartNs
                 + TimeUnit.SECONDS.toNanos(measureSec);
@@ -180,8 +186,30 @@ public class KafkaBenchmark {
         System.out.printf("[Run] Producers started. warmup=%ds, measure=%ds, total=%ds%n",
                 warmupSec, measureSec, warmupSec + measureSec);
 
-        Thread.sleep(((long) warmupSec + measureSec) * 1000L);
+        long runEndNs = startTimeNs
+                + TimeUnit.SECONDS.toNanos((long) warmupSec + measureSec);
+        boolean failFastTriggered = false;
+        while (running.get()) {
+            long nowNs = System.nanoTime();
+            if (nowNs >= runEndNs) break;
+            if (shouldFailFast(nowNs,
+                    ProducerTask.globalLastSuccessfulAckNs.get(),
+                    ProducerTask.globalOutstanding.get(),
+                    ProducerTask.globalFailures.get(), failFastStallSec)) {
+                failFastTriggered = true;
+                ProducerTask.globalFailFastAbort.set(true);
+                System.err.printf(
+                        "[FAIL-FAST] No successful producer ACK for %ds "
+                        + "(outstanding=%d, failures=%d); aborting run.%n",
+                        failFastStallSec, ProducerTask.globalOutstanding.get(),
+                        ProducerTask.globalFailures.get());
+                break;
+            }
+            TimeUnit.SECONDS.sleep(1);
+        }
         running.set(false);
+        if (failFastTriggered)
+            executor.shutdownNow();
 
         long outstandingAtEnd = 0;
         for (ProducerTask task : tasks) {
@@ -191,10 +219,12 @@ public class KafkaBenchmark {
         long drainStartNs = System.nanoTime();
 
         // send 중단 후 이미 제출한 요청을 flush한다. timeout run은 통계가 불완전할 수 있다.
-        boolean cleanFinish = doneLatch.await(drainTimeoutSec, TimeUnit.SECONDS);
+        int effectiveDrainTimeoutSec = failFastTriggered
+                ? Math.min(drainTimeoutSec, 30) : drainTimeoutSec;
+        boolean cleanFinish = doneLatch.await(effectiveDrainTimeoutSec, TimeUnit.SECONDS);
         if (!cleanFinish) {
             System.err.printf("[Warn] Some producers did not finish in %ds. Forcing shutdown.%n",
-                    drainTimeoutSec);
+                    effectiveDrainTimeoutSec);
         }
         long drainElapsedNs = System.nanoTime() - drainStartNs;
 
@@ -212,6 +242,9 @@ public class KafkaBenchmark {
 
         printMetrics(tasks, consumerTask, drainElapsedNs, cleanFinish,
                 consumerDrainCompleted, outstandingAtEnd);
+        if (failFastTriggered)
+            throw new IllegalStateException(
+                    "benchmark aborted after sustained producer ACK stall");
     }
 
     /**
@@ -507,6 +540,13 @@ public class KafkaBenchmark {
         return left * right;
     }
 
+    static boolean shouldFailFast(long nowNs, long lastSuccessfulAckNs,
+                                  long outstanding, long failures, int stallSec) {
+        return stallSec > 0
+                && nowNs - lastSuccessfulAckNs >= TimeUnit.SECONDS.toNanos(stallSec)
+                && (outstanding > 0 || failures > 0);
+    }
+
     /** 메모리 또는 측정 의미를 깨뜨릴 수 있는 CLI 조합을 broker 연결 전에 거부한다. */
     private static void validateConfig() {
         if (recordSize <= 0 || targetOps <= 0 || numProducers <= 0) {
@@ -516,7 +556,8 @@ public class KafkaBenchmark {
             throw new IllegalArgumentException("record-size exceeds configured max.request.size");
         }
         if (warmupSec < 0 || measureSec <= 0 || drainTimeoutSec <= 0
-                || dynamicTopicRate <= 0 || producerStartTimeoutSec <= 0) {
+                || dynamicTopicRate <= 0 || producerStartTimeoutSec <= 0
+                || failFastStallSec < 0) {
             throw new IllegalArgumentException(
                     "warmup-sec must be >= 0; durations and dynamic-topic-rate must be > 0");
         }
@@ -548,6 +589,9 @@ public class KafkaBenchmark {
         static volatile long measureEndNs = 0L;
         static final AtomicLong globalOutstanding = new AtomicLong(0);
         static final AtomicLong globalMaxOutstanding = new AtomicLong(0);
+        static final AtomicLong globalFailures = new AtomicLong(0);
+        static final AtomicLong globalLastSuccessfulAckNs = new AtomicLong(0);
+        static final AtomicBoolean globalFailFastAbort = new AtomicBoolean(false);
 
         private final int id;
         private final int opsPerSec;
@@ -752,9 +796,11 @@ public class KafkaBenchmark {
                             if (measured) measuredOutstanding.decrementAndGet();
                             if (exception != null) {
                                 sendErrors.incrementAndGet();
+                                globalFailures.incrementAndGet();
                                 if (measured) measuredFailures.incrementAndGet();
                                 return;
                             }
+                            globalLastSuccessfulAckNs.set(callbackNs);
                             int sec = elapsedSecond(callbackNs);
                             long latency = callbackNs - sendStart;
                             totalSent.incrementAndGet();
@@ -779,6 +825,7 @@ public class KafkaBenchmark {
                         });
                     } catch (Exception e) {
                         sendErrors.incrementAndGet();
+                        globalFailures.incrementAndGet();
                         if (permitAcquired) outstandingLimiter.release();
                         globalOutstanding.decrementAndGet();
                         if (measured) {
@@ -802,8 +849,12 @@ public class KafkaBenchmark {
                     // flush에서 제출된 record의 callback을 기다린다. main thread의 drain
                     // timeout이 먼저 끝나면 이 thread가 아직 실행 중일 수 있으므로 해당
                     // 결과는 Drain Completed=false로 무효 처리해야 한다.
-                    try { producer.flush(); } catch (Exception ignore) {}
-                    try { producer.close(Duration.ofSeconds(30)); } catch (Exception ignore) {}
+                    if (globalFailFastAbort.get()) {
+                        try { producer.close(Duration.ZERO); } catch (Exception ignore) {}
+                    } else {
+                        try { producer.flush(); } catch (Exception ignore) {}
+                        try { producer.close(Duration.ofSeconds(30)); } catch (Exception ignore) {}
+                    }
                 }
                 doneLatch.countDown();
             }
@@ -1037,6 +1088,7 @@ public class KafkaBenchmark {
                 case "--max-schedule-lag-ms": maxScheduleLagMs = Long.parseLong(value); break;
                 case "--producer-start-timeout-sec":
                     producerStartTimeoutSec = Integer.parseInt(value); break;
+                case "--fail-fast-stall-sec": failFastStallSec = Integer.parseInt(value); break;
                 default: throw new IllegalArgumentException("Unknown option: " + option);
             }
         }
