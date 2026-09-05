@@ -194,8 +194,7 @@ public class KafkaBenchmark {
             if (nowNs >= runEndNs) break;
             if (shouldFailFast(nowNs,
                     ProducerTask.globalLastSuccessfulAckNs.get(),
-                    ProducerTask.globalOutstanding.get(),
-                    ProducerTask.globalFailures.get(), failFastStallSec)) {
+                    failFastStallSec)) {
                 failFastTriggered = true;
                 ProducerTask.globalFailFastAbort.set(true);
                 System.err.printf(
@@ -541,10 +540,9 @@ public class KafkaBenchmark {
     }
 
     static boolean shouldFailFast(long nowNs, long lastSuccessfulAckNs,
-                                  long outstanding, long failures, int stallSec) {
+                                  int stallSec) {
         return stallSec > 0
-                && nowNs - lastSuccessfulAckNs >= TimeUnit.SECONDS.toNanos(stallSec)
-                && (outstanding > 0 || failures > 0);
+                && nowNs - lastSuccessfulAckNs >= TimeUnit.SECONDS.toNanos(stallSec);
     }
 
     /** 메모리 또는 측정 의미를 깨뜨릴 수 있는 CLI 조합을 broker 연결 전에 거부한다. */

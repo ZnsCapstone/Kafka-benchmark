@@ -44,13 +44,11 @@ class KafkaBenchmarkTest {
     }
 
     @Test
-    void failFastRequiresSustainedStallAndPendingOrFailedWork() {
+    void failFastRequiresOnlySustainedMissingAcks() {
         long second = 1_000_000_000L;
 
-        assertFalse(KafkaBenchmark.shouldFailFast(59 * second, 0, 1000, 0, 60));
-        assertFalse(KafkaBenchmark.shouldFailFast(60 * second, 0, 0, 0, 60));
-        assertFalse(KafkaBenchmark.shouldFailFast(600 * second, 0, 1000, 1, 0));
-        assertTrue(KafkaBenchmark.shouldFailFast(60 * second, 0, 1000, 0, 60));
-        assertTrue(KafkaBenchmark.shouldFailFast(60 * second, 0, 0, 1, 60));
+        assertFalse(KafkaBenchmark.shouldFailFast(59 * second, 0, 60));
+        assertFalse(KafkaBenchmark.shouldFailFast(600 * second, 0, 0));
+        assertTrue(KafkaBenchmark.shouldFailFast(60 * second, 0, 60));
     }
 }
